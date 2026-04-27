@@ -1,7 +1,9 @@
 #include "Session.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 extern "C" {
@@ -39,8 +41,11 @@ int64_t AudioFrameIndexForPts(int64_t pts_48k) {
 
 Session::Session(const std::string& webtorrent_url,
                  const std::string& infohash,
-                 int file_index)
+                 int file_index,
+                 int session_id)
     : url_(webtorrent_url + "/files/" + infohash + "/" + std::to_string(file_index))
+    , short_infohash_(infohash.substr(0, std::min<size_t>(8, infohash.size())))
+    , session_id_(session_id)
     , last_activity_(std::chrono::steady_clock::now()) {
     demuxer_ = std::make_unique<Demuxer>(url_);
     if (demuxer_->audio_stream_index() >= 0) {
@@ -148,10 +153,21 @@ struct SampleStore {
 std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
                                                  int64_t segment_start_ms,
                                                  int64_t segment_end_ms) {
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Header line (no indent), printed once for every segment request.
+    {
+        std::ostringstream hdr;
+        hdr << short_infohash_ << " s" << session_id_ << " #" << segment_idx << "\n";
+        std::cout << hdr.str() << std::flush;
+    }
+
     auto cache_it = segment_cache_.find(segment_idx);
     if (cache_it != segment_cache_.end()) {
-        std::cout << "[Session] Returning cached segment " << segment_idx
-                  << " (" << cache_it->second.size() << " bytes)" << std::endl;
+        std::ostringstream dbg;
+        dbg << "    [cache hit] returning cached segment ("
+            << cache_it->second.size() << " bytes)\n";
+        std::cout << dbg.str() << std::flush;
         return cache_it->second;
     }
 
@@ -170,6 +186,15 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
     int64_t audio_cutoff_pts =
         MsToAudioPts(segment_end_ms + kAudioLookaheadMs);
 
+    // Snapshot the AAC frame cache before this build so we can report how many
+    // of the requested output frames were satisfied from cache vs newly encoded.
+    int audio_cache_hits_pre = 0;
+    if (aac_) {
+        for (int64_t i = output_start_frame; i < output_end_frame; ++i) {
+            if (audio_frame_cache_.count(i)) ++audio_cache_hits_pre;
+        }
+    }
+
     demuxer_->SeekToMs(audio_decode_start_ms);
     if (aac_) aac_->Reset(segment_idx == 0 ? -aac_->initial_padding()
                                            : audio_encode_start_pts);
@@ -185,6 +210,25 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
     AVPacket* pkt = av_packet_alloc();
     bool seen_keyframe = false;
     bool hit_boundary = false;
+
+    // ── Debug counters ────────────────────────────────────────────────────────
+    int audio_packets_decoded = 0;
+    int64_t src_audio_pts_first_ms = INT64_MAX;
+    int64_t src_audio_pts_last_ms = INT64_MIN;
+    int64_t src_audio_pts_first_native = INT64_MAX;
+    int64_t src_audio_pts_last_native = INT64_MIN;
+    int video_keyframe_count = 0;
+
+    auto note_audio_pkt = [&](AVPacket* ap) {
+        ++audio_packets_decoded;
+        if (aud_stream && ap->pts != AV_NOPTS_VALUE) {
+            int64_t ms = av_rescale_q(ap->pts, aud_stream->time_base, AVRational{1, 1000});
+            if (ms < src_audio_pts_first_ms) src_audio_pts_first_ms = ms;
+            if (ms > src_audio_pts_last_ms)  src_audio_pts_last_ms  = ms;
+            if (ap->pts < src_audio_pts_first_native) src_audio_pts_first_native = ap->pts;
+            if (ap->pts > src_audio_pts_last_native)  src_audio_pts_last_native  = ap->pts;
+        }
+    };
 
     auto append_video_packet = [&](AVPacket* p) {
         if (!vid_stream) return;
@@ -208,6 +252,7 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
         }
 
         bool is_keyframe = (p->flags & AV_PKT_FLAG_KEY) != 0;
+        if (is_keyframe) ++video_keyframe_count;
 
         video_store.Append(p->data, static_cast<uint32_t>(p->size),
                            dts_out, duration, cts_off, is_keyframe);
@@ -291,7 +336,10 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
                             av_packet_unref(pkt);
                             break;
                         }
-                        if (apkt_ms >= audio_decode_start_ms) aac_->Decode(pkt);
+                        if (apkt_ms >= audio_decode_start_ms) {
+                            note_audio_pkt(pkt);
+                            aac_->Decode(pkt);
+                        }
                         av_packet_unref(pkt);
                     }
                 }
@@ -305,7 +353,10 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
             int64_t apkt_ms = aud_stream && pkt->pts != AV_NOPTS_VALUE
                 ? av_rescale_q(pkt->pts, aud_stream->time_base, AVRational{1, 1000})
                 : audio_decode_start_ms;
-            if (apkt_ms >= audio_decode_start_ms) aac_->Decode(pkt);
+            if (apkt_ms >= audio_decode_start_ms) {
+                note_audio_pkt(pkt);
+                aac_->Decode(pkt);
+            }
             total_audio_frames += drain_aac(audio_cutoff_pts);
         }
 
@@ -383,15 +434,134 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
     // Track storage owned by the SampleStore vectors goes out of scope here,
     // but BuildSegment has already copied all bytes into the output buffer.
 
-    if (total_audio_frames > 0) {
-        std::cout << "[Session] Segment " << segment_idx << " complete: "
-                  << samples_per_track[0].size() << " video samples, "
-                  << total_audio_frames << " audio frames, "
-                  << bytes.size() << " bytes" << std::endl;
-    } else {
-        std::cout << "[Session] Segment " << segment_idx << " complete (video-only): "
-                  << samples_per_track[0].size() << " samples, "
-                  << bytes.size() << " bytes" << std::endl;
+    // ── Debug block ──────────────────────────────────────────────────────────
+    {
+        const auto& vsamples = samples_per_track[0];
+        int64_t v_dts_first = vsamples.front().dts;
+        int64_t v_dts_last  = vsamples.back().dts;
+        int64_t v_pts_first = INT64_MAX, v_pts_last = INT64_MIN;
+        int32_t cts_min = INT32_MAX, cts_max = INT32_MIN;
+        uint32_t dur_min = UINT32_MAX, dur_max = 0;
+        uint64_t dur_sum = 0;
+        for (const auto& s : vsamples) {
+            int64_t pts = s.dts + s.cts_offset;
+            if (pts < v_pts_first) v_pts_first = pts;
+            if (pts > v_pts_last)  v_pts_last  = pts;
+            if (s.cts_offset < cts_min) cts_min = s.cts_offset;
+            if (s.cts_offset > cts_max) cts_max = s.cts_offset;
+            if (s.duration < dur_min) dur_min = s.duration;
+            if (s.duration > dur_max) dur_max = s.duration;
+            dur_sum += s.duration;
+        }
+        uint32_t dur_avg = vsamples.empty() ? 0
+            : static_cast<uint32_t>(dur_sum / vsamples.size());
+        int64_t v_dts_first_ms = av_rescale_q(v_dts_first, kVideoOutTb, AVRational{1, 1000});
+        int64_t v_dts_last_ms  = av_rescale_q(v_dts_last,  kVideoOutTb, AVRational{1, 1000});
+        int64_t v_pts_first_ms = av_rescale_q(v_pts_first, kVideoOutTb, AVRational{1, 1000});
+        int64_t v_pts_last_ms  = av_rescale_q(v_pts_last,  kVideoOutTb, AVRational{1, 1000});
+        int64_t v_tfdt = tfdt_per_track[0];
+
+        // Audio output stats from the audio_store before it was moved.
+        bool have_audio = aac_ && aac_codecpar_ && samples_per_track.size() > 1;
+        int64_t a_tfdt = have_audio ? tfdt_per_track[1] : 0;
+        size_t a_count = have_audio ? samples_per_track[1].size() : 0;
+        int64_t a_pts_first = 0, a_pts_last = 0;
+        int64_t a_idx_first = 0, a_idx_last = 0;
+        if (have_audio && a_count > 0) {
+            const auto& as = samples_per_track[1];
+            a_pts_first = as.front().dts;
+            a_pts_last  = as.back().dts;
+            a_idx_first = AudioFrameIndexForPts(a_pts_first);
+            a_idx_last  = AudioFrameIndexForPts(a_pts_last);
+        }
+
+        // Cache window after this build.
+        int64_t cache_idx_min = INT64_MAX, cache_idx_max = INT64_MIN;
+        for (const auto& [idx, _] : audio_frame_cache_) {
+            if (idx < cache_idx_min) cache_idx_min = idx;
+            if (idx > cache_idx_max) cache_idx_max = idx;
+        }
+
+        // Missing frame indices in the requested output range.
+        std::vector<int64_t> missing;
+        if (aac_) {
+            for (int64_t i = output_start_frame; i < output_end_frame; ++i) {
+                if (!audio_frame_cache_.count(i)) missing.push_back(i);
+            }
+        }
+
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        std::ostringstream dbg;
+        dbg << "    range:    [" << segment_start_ms << " ms, " << segment_end_ms
+            << " ms]  span=" << (segment_end_ms - segment_start_ms) << " ms\n";
+        dbg << "    video:    " << vsamples.size() << " samples ("
+            << video_keyframe_count << " keyframes)  tb=1/16000\n";
+        dbg << "      dts:    [" << v_dts_first << ", " << v_dts_last
+            << "]  ms=[" << v_dts_first_ms << ", " << v_dts_last_ms << "]\n";
+        dbg << "      pts:    [" << v_pts_first << ", " << v_pts_last
+            << "]  ms=[" << v_pts_first_ms << ", " << v_pts_last_ms << "]\n";
+        dbg << "      tfdt:   " << v_tfdt << " ticks\n";
+        dbg << "      cts_off:[" << cts_min << ", " << cts_max
+            << "]  durations: min=" << dur_min << " avg=" << dur_avg
+            << " max=" << dur_max << "\n";
+
+        if (aac_) {
+            dbg << "    audio:    " << a_count << " AAC frames written  tb=1/48000\n";
+            dbg << "      output_range: frame_idx=[" << output_start_frame
+                << ", " << output_end_frame << ")  ("
+                << (output_end_frame - output_start_frame) << " frames)\n";
+            dbg << "      cache_hits_pre_build: " << audio_cache_hits_pre << "/"
+                << (output_end_frame - output_start_frame) << "\n";
+            dbg << "      encoded_this_build:   " << total_audio_frames
+                << " AAC frames\n";
+            dbg << "      src TrueHD pkts decoded: " << audio_packets_decoded;
+            if (audio_packets_decoded > 0) {
+                dbg << "  src_pts_ms=[" << src_audio_pts_first_ms
+                    << ", " << src_audio_pts_last_ms << "]";
+                if (aud_stream) {
+                    dbg << "  src_pts_native=[" << src_audio_pts_first_native
+                        << ", " << src_audio_pts_last_native
+                        << "] tb=" << aud_stream->time_base.num << "/"
+                        << aud_stream->time_base.den;
+                }
+            }
+            dbg << "\n";
+            dbg << "      decode_window: ms=[" << audio_decode_start_ms
+                << ", " << (segment_end_ms + kAudioLookaheadMs)
+                << "]  cutoff_pts_48k=" << audio_cutoff_pts << "\n";
+            if (a_count > 0) {
+                dbg << "      out frame_idx: [" << a_idx_first << ", "
+                    << a_idx_last << "]  pts_48k=[" << a_pts_first << ", "
+                    << a_pts_last << "]\n";
+                dbg << "      audio tfdt:   " << a_tfdt << " ticks ("
+                    << av_rescale_q(a_tfdt, kAudioOutTb, AVRational{1, 1000})
+                    << " ms)\n";
+            } else {
+                dbg << "      out frame_idx: <none>\n";
+            }
+            dbg << "      cache: " << audio_frame_cache_.size() << " entries";
+            if (cache_idx_min != INT64_MAX) {
+                dbg << "  idx=[" << cache_idx_min << ", " << cache_idx_max << "]";
+            }
+            dbg << "\n";
+            if (missing.empty()) {
+                dbg << "      gaps in output range: none\n";
+            } else {
+                dbg << "      gaps in output range: " << missing.size()
+                    << " missing frame(s):";
+                size_t show = std::min<size_t>(missing.size(), 16);
+                for (size_t i = 0; i < show; ++i) dbg << " " << missing[i];
+                if (missing.size() > show) dbg << " ...";
+                dbg << "\n";
+            }
+        } else {
+            dbg << "    audio:    <no audio track>\n";
+        }
+        dbg << "    bytes:    " << bytes.size()
+            << "  elapsed=" << elapsed_ms << " ms\n";
+        std::cout << dbg.str() << std::flush;
     }
 
     segment_cache_[segment_idx] = bytes;

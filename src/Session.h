@@ -33,7 +33,8 @@ class Session {
 public:
     Session(const std::string& webtorrent_url,
             const std::string& infohash,
-            int file_index = 0);
+            int file_index,
+            int session_id);
     ~Session();
 
     Session(const Session&) = delete;
@@ -56,6 +57,8 @@ private:
                                             int64_t segment_end_ms);
 
     std::string url_;
+    std::string short_infohash_;  // first 8 chars, used for debug logging
+    int session_id_ = 0;
     std::unique_ptr<Demuxer> demuxer_;
     std::unique_ptr<AacTranscoder> aac_;
     AVCodecParameters* aac_codecpar_ = nullptr;  // populated after AAC encoder open

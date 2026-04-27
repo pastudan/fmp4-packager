@@ -30,7 +30,8 @@ std::pair<int, std::shared_ptr<fmp4::Session>> CreateSession(const std::string& 
     int session_id = g_next_session_id.fetch_add(1);
     std::string key = infohash + "_session-" + std::to_string(session_id);
 
-    auto session = std::make_shared<fmp4::Session>(g_webtorrent_url, infohash, file_index);
+    auto session = std::make_shared<fmp4::Session>(g_webtorrent_url, infohash,
+                                                   file_index, session_id);
 
     std::lock_guard<std::mutex> lock(g_sessions_mutex);
     g_sessions[key] = session;
@@ -166,8 +167,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
             int session_id = std::stoi(req.matches[2]);
             int64_t segment_idx = std::stoll(req.matches[3]);
 
-            std::cout << "[GET] " << infohash << "/session-" << session_id << "/"
-                      << segment_idx << ".m4s" << std::endl;
+            // Header line for this segment request is emitted from
+            // Session::BuildSegmentLocked along with the indented debug block
+            // (see Session.cpp), so we don't print one here.
 
             try {
                 auto session = GetSession(infohash, session_id);
