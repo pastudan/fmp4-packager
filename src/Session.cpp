@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 
@@ -202,6 +203,11 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
     SampleStore video_store;
     SampleStore audio_store;
 
+    // Per-build AAC frame storage (keyed by frame_idx). This is local to the
+    // current segment build so all frames in this segment's output come from a
+    // single encoder session, avoiding MDCT boundary artifacts.
+    std::map<int64_t, std::vector<uint8_t>> this_build_aac;
+
     int video_idx = demuxer_->video_stream_index();
     int audio_idx = demuxer_->audio_stream_index();
     AVStream* vid_stream = demuxer_->video_stream();
@@ -280,9 +286,12 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
         for (AVPacket* ep : enc_pkts) {
             if (ep->pts != AV_NOPTS_VALUE && ep->size > 0) {
                 int64_t frame_idx = AudioFrameIndexForPts(ep->pts);
-                audio_frame_cache_.try_emplace(
-                    frame_idx,
-                    std::vector<uint8_t>(ep->data, ep->data + ep->size));
+                std::vector<uint8_t> payload(ep->data, ep->data + ep->size);
+                // Always insert into this segment's local map (overwrites if present).
+                this_build_aac[frame_idx] = payload;
+                // Also feed the session-wide cache as a backstop for diagnostic purposes,
+                // but never overwrite existing entries (try_emplace).
+                audio_frame_cache_.try_emplace(frame_idx, std::move(payload));
             }
             av_packet_free(&ep);
         }
@@ -371,17 +380,24 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
     av_packet_free(&pkt);
     fix_video_durations();
 
+    int cache_fallback_count = 0;
     if (aac_) {
         for (int64_t frame_idx = output_start_frame;
              frame_idx < output_end_frame;
              ++frame_idx) {
-            auto it = audio_frame_cache_.find(frame_idx);
-            if (it == audio_frame_cache_.end()) continue;
-            audio_store.Append(it->second,
-                               frame_idx * 1024,
-                               1024,
-                               /*cts_offset=*/0,
-                               /*is_keyframe=*/true);
+            // Prefer frames from this build's encoder session.
+            auto it = this_build_aac.find(frame_idx);
+            if (it != this_build_aac.end()) {
+                audio_store.Append(it->second, frame_idx * 1024, 1024, 0, true);
+                continue;
+            }
+            // Diagnostic backstop: fall back to session-wide cache if missing
+            // (should never happen with correct preroll math).
+            auto cache_it = audio_frame_cache_.find(frame_idx);
+            if (cache_it != audio_frame_cache_.end()) {
+                ++cache_fallback_count;
+                audio_store.Append(cache_it->second, frame_idx * 1024, 1024, 0, true);
+            }
         }
 
         while (audio_frame_cache_.size() > kMaxCachedAudioFrames) {
@@ -482,11 +498,13 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
             if (idx > cache_idx_max) cache_idx_max = idx;
         }
 
-        // Missing frame indices in the requested output range.
+        // Missing frame indices in the requested output range (from this build).
         std::vector<int64_t> missing;
         if (aac_) {
             for (int64_t i = output_start_frame; i < output_end_frame; ++i) {
-                if (!audio_frame_cache_.count(i)) missing.push_back(i);
+                if (!this_build_aac.count(i) && !audio_frame_cache_.count(i)) {
+                    missing.push_back(i);
+                }
             }
         }
 
@@ -513,9 +531,14 @@ std::vector<uint8_t> Session::BuildSegmentLocked(int64_t segment_idx,
                 << ", " << output_end_frame << ")  ("
                 << (output_end_frame - output_start_frame) << " frames)\n";
             dbg << "      cache_hits_pre_build: " << audio_cache_hits_pre << "/"
-                << (output_end_frame - output_start_frame) << "\n";
+                << (output_end_frame - output_start_frame)
+                << " (from prior segment encoders — NOT used)\n";
             dbg << "      encoded_this_build:   " << total_audio_frames
                 << " AAC frames\n";
+            if (cache_fallback_count > 0) {
+                dbg << "      WARN: session_cache_fallback: " << cache_fallback_count
+                    << " frames (preroll math insufficient!)\n";
+            }
             dbg << "      src TrueHD pkts decoded: " << audio_packets_decoded;
             if (audio_packets_decoded > 0) {
                 dbg << "  src_pts_ms=[" << src_audio_pts_first_ms
